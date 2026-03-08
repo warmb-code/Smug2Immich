@@ -23,10 +23,13 @@ pip install -r requirements.txt
 
 python Smug2Immich.py \
   -u YOUR_SMUGMUG_USERNAME \
-  -s YOUR_SMSESS_COOKIE \
+  --api-key YOUR_SMUGMUG_API_KEY \
+  --api-secret YOUR_SMUGMUG_API_SECRET \
   --immich-server http://your-immich-server:8080 \
   --immich-api-key YOUR_IMMICH_API_KEY
 ```
+
+On first run you'll be prompted to authorize via SmugMug's OAuth flow (one-time setup). The access tokens are saved so you won't need to do this again.
 
 ### Docker
 
@@ -35,7 +38,8 @@ docker compose build
 
 docker compose run smug2immich \
   -u YOUR_SMUGMUG_USERNAME \
-  -s YOUR_SMSESS_COOKIE \
+  --api-key YOUR_SMUGMUG_API_KEY \
+  --api-secret YOUR_SMUGMUG_API_SECRET \
   --immich-server http://localhost:8080 \
   --immich-api-key YOUR_IMMICH_API_KEY
 ```
@@ -45,7 +49,8 @@ Run in the background with `-d`:
 ```bash
 docker compose run -d smug2immich \
   -u YOUR_SMUGMUG_USERNAME \
-  -s YOUR_SMSESS_COOKIE \
+  --api-key YOUR_SMUGMUG_API_KEY \
+  --api-secret YOUR_SMUGMUG_API_SECRET \
   --immich-server http://localhost:8080 \
   --immich-api-key YOUR_IMMICH_API_KEY
 ```
@@ -56,20 +61,32 @@ Check progress:
 docker logs -f <container_name>
 ```
 
-## Getting Your SmugMug Session Cookie
+## Authentication
+
+### OAuth (recommended)
+
+1. Go to [SmugMug API Keys](https://api.smugmug.com/api/developer/apply) and create an application
+2. Copy your **API Key** and **API Secret**
+3. On first run, you'll be given a URL to authorize the app — open it in your browser, approve it, and enter the 6-digit verification code
+4. Access tokens are saved automatically for future runs
+
+### Session cookie (legacy)
+
+If you prefer not to use OAuth, you can pass a session cookie instead:
 
 1. Log in to SmugMug in your web browser
 2. Open DevTools (F12) → **Application** → **Cookies** → `https://www.smugmug.com`
 3. Copy the value of the `SMSESS` cookie
-
-This is only required if your SmugMug account is password protected.
+4. Pass it with `-s YOUR_SMSESS_COOKIE`
 
 ## Options
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `-u`, `--user` | *(required)* | SmugMug username (from `USERNAME.smugmug.com`) |
-| `-s`, `--session` | | SmugMug `SMSESS` cookie for password-protected accounts |
+| `--api-key` | *(prompted)* | SmugMug API key (OAuth consumer key, saved after first use) |
+| `--api-secret` | *(prompted)* | SmugMug API secret (OAuth consumer secret, saved after first use) |
+| `-s`, `--session` | | SmugMug `SMSESS` cookie (legacy alternative to OAuth) |
 | `--immich-server` | *(prompted)* | Immich server URL (saved after first use) |
 | `--immich-api-key` | *(prompted)* | Immich API key (saved after first use) |
 | `-o`, `--output` | `output/` | Temporary output directory (only used with `--keep-files`) |
@@ -110,7 +127,7 @@ Use `--reset` to start fresh and re-upload everything.
 ## Requirements
 
 - Python 3.10+
-- Dependencies: `requests`, `beautifulsoup4`, `tqdm`, `colored`
+- Dependencies: `requests`, `requests_oauthlib`, `beautifulsoup4`, `tqdm`, `colored`
 
 ## License
 
