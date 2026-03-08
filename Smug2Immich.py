@@ -208,22 +208,41 @@ def save_progress():
     save_state(state)
 
 
-def get_json(url):
-    """Fetch SmugMug API endpoint, extract JSON from HTML <pre> tags."""
-    try:
-        r = smugmug_session.get(ENDPOINT + url, timeout=args.timeout)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        pres = soup.find_all("pre")
-        if not pres:
+def get_json(url, max_attempts=5):
+    """Fetch SmugMug API endpoint, extract JSON from HTML <pre> tags.
+    Respects rate limit headers and Retry-After on 429."""
+    for attempt in range(max_attempts):
+        try:
+            r = smugmug_session.get(ENDPOINT + url, timeout=args.timeout)
+
+            # Respect rate limiting
+            if r.status_code == 429:
+                retry_after = int(r.headers.get("Retry-After", 10))
+                if args.verbose_errors:
+                    print(f"\n  RATE LIMITED: waiting {retry_after}s before retry ({url})", flush=True)
+                time.sleep(retry_after)
+                continue
+
+            # Proactively slow down when running low on quota
+            remaining = r.headers.get("X-RateLimit-Remaining")
+            if remaining is not None and int(remaining) < 10:
+                time.sleep(1)
+
+            r.raise_for_status()
+            soup = BeautifulSoup(r.text, "html.parser")
+            pres = soup.find_all("pre")
+            if not pres:
+                if args.verbose_errors:
+                    print(f"\n  ERROR: No JSON found in response from {url}")
+                return None
+            return json.loads(pres[-1].text)
+        except (json.JSONDecodeError, requests.exceptions.RequestException) as e:
             if args.verbose_errors:
-                print(f"\n  ERROR: No JSON found in response from {url}")
-            return None
-        return json.loads(pres[-1].text)
-    except (json.JSONDecodeError, requests.exceptions.RequestException) as e:
-        if args.verbose_errors:
-            print(f"\n  ERROR: {type(e).__name__} for {url}: {e}")
-        return None
+                print(f"\n  ERROR: {type(e).__name__} for {url}: {e}")
+            if attempt + 1 < max_attempts:
+                time.sleep(2 ** attempt)
+
+    return None
 
 
 def upload_to_immich(file_data, filename, device_asset_id, created_at=None):
@@ -496,7 +515,9 @@ def load_album_images(album):
     if shutdown_requested:
         return album, None
 
-    images = get_json(album["Uri"] + "!images")
+    # Request larger pages and only the fields we need to reduce API load
+    image_fields = "FileName,ImageKey,Key,DateTimeOriginal,DateTimeUploaded,ArchivedUri,Uris"
+    images = get_json(album["Uri"] + f"!images?count=500&_filter={image_fields}")
     if images is None or shutdown_requested:
         return album, None
 
@@ -515,10 +536,15 @@ def load_album_images(album):
     return album, album_images
 
 
-print(f"Loading images from {len(albums_to_process)} albums (10 parallel)...", flush=True)
+album_loader_workers = min(args.workers, len(albums_to_process))
+total_albums = len(albums_to_process)
+print(f"Loading images from {total_albums} albums ({album_loader_workers} parallel)...", flush=True)
 
 album_results = {}
-with ThreadPoolExecutor(max_workers=10) as loader:
+albums_loaded = 0
+load_start_time = time.time()
+
+with ThreadPoolExecutor(max_workers=album_loader_workers) as loader:
     futures = {loader.submit(load_album_images, a): a for a in albums_to_process}
     for future in as_completed(futures):
         if shutdown_requested:
@@ -527,8 +553,16 @@ with ThreadPoolExecutor(max_workers=10) as loader:
             break
         album, images = future.result()
         album_results[album["Name"]] = (album, images)
+        albums_loaded += 1
+
+        elapsed = time.time() - load_start_time
+        avg_per_album = elapsed / albums_loaded
+        remaining = (total_albums - albums_loaded) * avg_per_album
+        mins_left = int(remaining // 60)
+        secs_left = int(remaining % 60)
+
         status = "ERROR" if images is None else f"{len(images)} images" if images else "empty"
-        print(f"  {album['Name']}: {status}", flush=True)
+        print(f"  [{albums_loaded}/{total_albums}, ~{mins_left}m{secs_left:02d}s left] {album['Name']}: {status}", flush=True)
 
 if shutdown_requested:
     save_progress()
