@@ -1,0 +1,13 @@
+services:
+  smug2immich:
+    build: .
+    container_name: smug2immich
+    volumes:
+      - ./data:/app/data
+    # Use host network so it can reach Immich on localhost/LAN
+    network_mode: host
+    # Pass all args after 'docker compose run smug2immich'
+    # Example:
+    #   docker compose run smug2immich -u YOUR_USERNAME -s <SMSESS_COOKIE> \
+    #     --immich-server http://localhost:8080 \
+    #     --immich-api-key <API_KEY>

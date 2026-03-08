@@ -1,0 +1,9 @@
+.venv/
+.idea/
+.DS_Store
+__pycache__/
+*.pyc
+output/
+data/
+.smug2immich.json
+.smug2immich_state.json
