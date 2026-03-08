@@ -112,9 +112,10 @@ if args.reset_config:
         print("Config cleared.")
 
 if args.reset:
-    if os.path.exists(STATE_FILE):
-        os.remove(STATE_FILE)
-        print("Progress state cleared.")
+    for f in [STATE_FILE, os.path.join(DATA_DIR, ".smug2immich_albums.json")]:
+        if os.path.exists(f):
+            os.remove(f)
+    print("Progress and album cache cleared.")
 
 # Load / prompt for Immich config
 cfg = load_config()
@@ -505,9 +506,43 @@ albums_to_process = [
 if not albums_to_process:
     sys.exit("No matching albums found.")
 
+# --- Album image cache (survives restarts) ---
+
+ALBUM_CACHE_FILE = os.path.join(DATA_DIR, ".smug2immich_albums.json")
+
+
+def load_album_cache():
+    if os.path.exists(ALBUM_CACHE_FILE):
+        try:
+            with open(ALBUM_CACHE_FILE, 'r') as f:
+                return json.load(f)
+        except (json.JSONDecodeError, OSError):
+            pass
+    return {}
+
+
+def save_album_cache(cache):
+    with open(ALBUM_CACHE_FILE, 'w') as f:
+        json.dump(cache, f)
+
+
 # Gather all images, skipping already-completed ones
 all_work = []
 skipped_count = 0
+
+# Load cached album image data from previous runs
+album_image_cache = load_album_cache()
+albums_needing_load = []
+album_results = {}
+
+for a in albums_to_process:
+    if a["Name"] in album_image_cache:
+        album_results[a["Name"]] = (a, album_image_cache[a["Name"]])
+    else:
+        albums_needing_load.append(a)
+
+if album_image_cache:
+    print(f"Album cache: {len(album_results)} cached, {len(albums_needing_load)} to fetch", flush=True)
 
 
 def load_album_images(album):
@@ -536,37 +571,48 @@ def load_album_images(album):
     return album, album_images
 
 
-album_loader_workers = min(args.workers, len(albums_to_process))
-total_albums = len(albums_to_process)
-print(f"Loading images from {total_albums} albums ({album_loader_workers} parallel)...", flush=True)
+if albums_needing_load:
+    album_loader_workers = min(args.workers, len(albums_needing_load))
+    total_to_load = len(albums_needing_load)
+    print(f"Loading images from {total_to_load} albums ({album_loader_workers} parallel)...", flush=True)
 
-album_results = {}
-albums_loaded = 0
-load_start_time = time.time()
+    albums_loaded = 0
+    load_start_time = time.time()
+    cache_save_interval = 50  # save cache every N albums
 
-with ThreadPoolExecutor(max_workers=album_loader_workers) as loader:
-    futures = {loader.submit(load_album_images, a): a for a in albums_to_process}
-    for future in as_completed(futures):
-        if shutdown_requested:
-            for f in futures:
-                f.cancel()
-            break
-        album, images = future.result()
-        album_results[album["Name"]] = (album, images)
-        albums_loaded += 1
+    with ThreadPoolExecutor(max_workers=album_loader_workers) as loader:
+        futures = {loader.submit(load_album_images, a): a for a in albums_needing_load}
+        for future in as_completed(futures):
+            if shutdown_requested:
+                for f in futures:
+                    f.cancel()
+                break
+            album, images = future.result()
+            album_results[album["Name"]] = (album, images)
+            albums_loaded += 1
 
-        elapsed = time.time() - load_start_time
-        avg_per_album = elapsed / albums_loaded
-        remaining = (total_albums - albums_loaded) * avg_per_album
-        mins_left = int(remaining // 60)
-        secs_left = int(remaining % 60)
+            # Cache successfully loaded albums
+            if images is not None:
+                album_image_cache[album["Name"]] = images
 
-        status = "ERROR" if images is None else f"{len(images)} images" if images else "empty"
-        print(f"  [{albums_loaded}/{total_albums}, ~{mins_left}m{secs_left:02d}s left] {album['Name']}: {status}", flush=True)
+            # Periodically save cache to survive restarts
+            if albums_loaded % cache_save_interval == 0:
+                save_album_cache(album_image_cache)
+
+            elapsed = time.time() - load_start_time
+            avg_per_album = elapsed / albums_loaded
+            remaining = (total_to_load - albums_loaded) * avg_per_album
+            mins_left = int(remaining // 60)
+            secs_left = int(remaining % 60)
+
+            status = "ERROR" if images is None else f"{len(images)} images" if images else "empty"
+            print(f"  [{albums_loaded}/{total_to_load}, ~{mins_left}m{secs_left:02d}s left] {album['Name']}: {status}", flush=True)
+
+    # Save cache after loading completes (or is interrupted)
+    save_album_cache(album_image_cache)
 
 if shutdown_requested:
-    save_progress()
-    print("\nInterrupted during album loading. Re-run to resume.")
+    print("\nInterrupted during album loading. Progress cached — re-run to resume.")
     sys.exit(0)
 
 # Process results in original album order

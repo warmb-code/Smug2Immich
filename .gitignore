@@ -7,3 +7,4 @@ output/
 data/
 .smug2immich.json
 .smug2immich_state.json
+.smug2immich_albums.json
