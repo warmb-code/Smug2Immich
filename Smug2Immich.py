@@ -7,6 +7,7 @@ sys.stdout.reconfigure(line_buffering=True)
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from requests_oauthlib import OAuth1Session
 import json
 import re
 import argparse
@@ -76,7 +77,11 @@ def save_state(state):
 parser = argparse.ArgumentParser(description="SmugMug Downloader with Immich Upload")
 parser.add_argument(
     "-s", "--session",
-    help="session ID (required if user is password protected); log in on a web browser and paste the SMSESS cookie")
+    help="(legacy) session cookie; prefer OAuth with --api-key/--api-secret instead")
+parser.add_argument(
+    "--api-key", default=None, help="SmugMug API key (OAuth consumer key, saved after first use)")
+parser.add_argument(
+    "--api-secret", default=None, help="SmugMug API secret (OAuth consumer secret, saved after first use)")
 parser.add_argument(
     "-u", "--user", help="username (from URL, USERNAME.smugmug.com)", required=True)
 parser.add_argument("-o", "--output", default="output/",
@@ -124,8 +129,8 @@ immich_api_key = get_config_value(cfg, "immich_api_key", "Immich API key: ", arg
 
 # --- Shared sessions with connection pooling and automatic retries ---
 
-def _make_session(cookies=None, extra_headers=None):
-    s = requests.Session()
+def _mount_adapters(session):
+    """Add retry and connection pooling adapters to a session."""
     retry = Retry(
         total=MAX_RETRIES,
         backoff_factor=1,
@@ -133,8 +138,14 @@ def _make_session(cookies=None, extra_headers=None):
         allowed_methods=["GET", "POST"],
     )
     adapter = HTTPAdapter(max_retries=retry, pool_connections=20, pool_maxsize=20)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+
+def _make_session(cookies=None, extra_headers=None):
+    s = requests.Session()
+    _mount_adapters(s)
     if cookies:
         s.cookies.update(cookies)
     if extra_headers:
@@ -142,8 +153,67 @@ def _make_session(cookies=None, extra_headers=None):
     return s
 
 
-cookies = {"SMSESS": args.session} if args.session else {}
-smugmug_session = _make_session(cookies=cookies)
+# --- SmugMug OAuth 1.0a setup ---
+
+SMUGMUG_REQUEST_TOKEN_URL = "https://api.smugmug.com/services/oauth/1.0a/getRequestToken"
+SMUGMUG_AUTHORIZE_URL = "https://api.smugmug.com/services/oauth/1.0a/authorize"
+SMUGMUG_ACCESS_TOKEN_URL = "https://api.smugmug.com/services/oauth/1.0a/getAccessToken"
+SMUGMUG_API_ORIGIN = "https://api.smugmug.com"
+
+use_oauth = False
+api_key = get_config_value(cfg, "smugmug_api_key", "SmugMug API key: ", args.api_key) if args.api_key else cfg.get("smugmug_api_key")
+api_secret = get_config_value(cfg, "smugmug_api_secret", "SmugMug API secret: ", args.api_secret) if args.api_secret else cfg.get("smugmug_api_secret")
+
+if api_key and api_secret:
+    use_oauth = True
+    # Check for saved access token
+    access_token = cfg.get("smugmug_access_token")
+    access_token_secret = cfg.get("smugmug_access_token_secret")
+
+    if not access_token or not access_token_secret:
+        # OAuth PIN flow to get access token
+        print("\nSmugMug OAuth authorization required (one-time setup)...")
+        oauth = OAuth1Session(api_key, client_secret=api_secret, callback_uri="oob")
+        request_token = oauth.fetch_request_token(SMUGMUG_REQUEST_TOKEN_URL)
+
+        auth_url = oauth.authorization_url(SMUGMUG_AUTHORIZE_URL, access="Full", permissions="Read")
+        print(f"\n1. Open this URL in your browser:\n   {auth_url}")
+        print("\n2. Authorize the app, then enter the 6-digit verification code:")
+        verifier = input("   Verification code: ").strip()
+
+        oauth = OAuth1Session(
+            api_key,
+            client_secret=api_secret,
+            resource_owner_key=request_token["oauth_token"],
+            resource_owner_secret=request_token["oauth_token_secret"],
+            verifier=verifier,
+        )
+        access_resp = oauth.fetch_access_token(SMUGMUG_ACCESS_TOKEN_URL)
+        access_token = access_resp["oauth_token"]
+        access_token_secret = access_resp["oauth_token_secret"]
+
+        cfg["smugmug_access_token"] = access_token
+        cfg["smugmug_access_token_secret"] = access_token_secret
+        save_config(cfg)
+        print("OAuth tokens saved — you won't need to do this again.\n")
+
+    smugmug_session = OAuth1Session(
+        api_key,
+        client_secret=api_secret,
+        resource_owner_key=access_token,
+        resource_owner_secret=access_token_secret,
+    )
+    _mount_adapters(smugmug_session)
+    smugmug_session.headers.update({"Accept": "application/json"})
+    print("Using OAuth 1.0a authentication for SmugMug API.")
+elif args.session:
+    cookies = {"SMSESS": args.session}
+    smugmug_session = _make_session(cookies=cookies)
+    print("Using session cookie authentication (legacy).")
+else:
+    print("ERROR: Provide either --api-key/--api-secret (OAuth) or --session (cookie).")
+    sys.exit(1)
+
 immich_session = _make_session(extra_headers={
     "x-api-key": immich_api_key,
     "Accept": "application/json",
@@ -210,11 +280,12 @@ def save_progress():
 
 
 def get_json(url, max_attempts=5):
-    """Fetch SmugMug API endpoint, extract JSON from HTML <pre> tags.
+    """Fetch SmugMug API endpoint. Uses clean JSON with OAuth, or HTML parsing with cookie auth.
     Respects rate limit headers and Retry-After on 429."""
+    base_url = SMUGMUG_API_ORIGIN if use_oauth else ENDPOINT
     for attempt in range(max_attempts):
         try:
-            r = smugmug_session.get(ENDPOINT + url, timeout=args.timeout)
+            r = smugmug_session.get(base_url + url, timeout=args.timeout)
 
             # Respect rate limiting
             if r.status_code == 429:
@@ -230,13 +301,18 @@ def get_json(url, max_attempts=5):
                 time.sleep(1)
 
             r.raise_for_status()
-            soup = BeautifulSoup(r.text, "html.parser")
-            pres = soup.find_all("pre")
-            if not pres:
-                if args.verbose_errors:
-                    print(f"\n  ERROR: No JSON found in response from {url}")
-                return None
-            return json.loads(pres[-1].text)
+
+            if use_oauth:
+                return r.json()
+            else:
+                # Legacy cookie auth: JSON is embedded in HTML <pre> tags
+                soup = BeautifulSoup(r.text, "html.parser")
+                pres = soup.find_all("pre")
+                if not pres:
+                    if args.verbose_errors:
+                        print(f"\n  ERROR: No JSON found in response from {url}")
+                    return None
+                return json.loads(pres[-1].text)
         except (json.JSONDecodeError, requests.exceptions.RequestException) as e:
             if args.verbose_errors:
                 print(f"\n  ERROR: {type(e).__name__} for {url}: {e}")
